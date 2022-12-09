@@ -1,0 +1,616 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+
+Description: >
+  Build artifacts and other resources needed by the DevOps team
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterLabels:
+      S3ServerSideEncryption:
+        default: S3 Server-side Encryption
+      S3EncryptionKeyArn:
+        default: KMS Master Key ARN for S3 Server-side Encryption
+      GitServer:
+        default: Git Repository Hosting Provider
+      GitRepoId:
+        default: Git Repository Identifier
+      GitRepoBranch:
+        default: Git Repository Branch
+      RegistryServer:
+        default: Container Image Registry Server
+      RegistryOwner:
+        default: Container Image Registry Account
+      RegistryCredentialsArn:
+        default: Container Image Registry Credentials ARN
+    ParameterGroups:
+      - Label:
+          default: CI/CD Configuration
+        Parameters:
+          - S3ServerSideEncryption
+          - S3EncryptionKeyArn
+          - GitServer
+          - GitRepoId
+          - GitRepoBranch
+          - RegistryServer
+          - RegistryOwner
+          - RegistryCredentialsArn
+
+
+Parameters:
+  S3ServerSideEncryption:
+    Type: String
+    Default: SSE-S3
+    AllowedValues:
+      - SSE-S3
+      - SSE-KMS
+    Description: >
+      The stack will encrypt the S3 storage with a key of this type.  SSE-KMS costs more but enables key usage auditing and offers better control over key management
+  S3EncryptionKeyArn:
+    Type: String
+    Default: ''
+    Description: >
+      The stack will use this (symmetric) KMS master key to encrypt the S3 storage.
+  GitServer:
+    Type: String
+    Default: GitHub
+    Description: >-
+      The continuous delivery pipeline will connect to the specified service to access the Git repository specified below.
+    AllowedValues:
+      - Bitbucket
+      - CodeCommit
+      - GitHub
+      - GitHubEnterpriseServer
+  GitRepoId:
+    Type: String
+    Description: >-
+      The continuous delivery pipeline will detect source changes in the specified Git repository, e.g., `example/repo` (GitHub), `arn:aws:codecommit:us-east-1:123456789012:example-repo` (CodeCommit).
+  GitRepoBranch:
+    Type: String
+    Default: main
+    Description: >-
+      The continuous delivery pipeline will detect source changes in this branch of the above repository, e.g., `production`.
+  RegistryServer:
+    Type: String
+    Default: hub.docker.com
+    Description: >-
+      The continuous delivery pipeline will connect to the specified service to access the container image registry specified below, e.g., `hub.docker.com` (Docker Hub), `public.ecr.aws` (Amazon ECR).
+  RegistryOwner:
+    Type: String
+    Description: >-
+      Container images will be uploaded to this account in registry, e.g., `mobythewhale` (Docker Hub), `a1b2c3d4` (Amazon ECR public registry).
+  RegistryCredentialsArn:
+    Type: String
+    Default: ''
+    Description: >-
+      The continuous delivery pipeline will use these credentials stored in AWS Secrets Manager to access the container image registry.
+      TODO: secret format json
+
+
+Conditions:
+  S3UseDefaultEncryption:
+    !Equals [ !Ref S3ServerSideEncryption, SSE-S3 ]
+  S3UseDefaultEncryptionKey:
+    !Equals [ !Ref S3EncryptionKeyArn, '' ]
+  UseCodeCommit:
+    !Equals [ !Ref GitServer, CodeCommit ]
+  UseCodeStarConnections:
+    !Not [ !Equals [ !Ref GitServer, CodeCommit ] ]
+
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref AWS::StackName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm:
+                Fn::If:
+                  - S3UseDefaultEncryption
+                  - AES256
+                  - aws:kms
+              KMSMasterKeyID:
+                Fn::If:
+                  - S3UseDefaultEncryption
+                  - !Ref AWS::NoValue
+                  - Fn::If:
+                      - S3UseDefaultEncryptionKey
+                      - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+                      - !Ref S3EncryptionKeyArn
+  S3BucketReadOnlyAcl:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-S3-readonly-artifact-access
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+
+  # see also CodeBuildServiceRolePolicy
+  SatosaImages:
+    Type: AWS::ECR::PublicRepository
+    Properties:
+      RepositoryName: satosa
+      RepositoryCatalogData:
+        RepositoryDescription:
+          Docker Official Image packaging for SATOSA
+        OperatingSystems:
+          - Linux
+        Architectures:
+          - x86-64
+
+  # build environment
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.0.0/18
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Public Subnet (AZ1)
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: 10.0.64.0/18
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Public Subnet (AZ2)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: 10.0.128.0/18
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Private Subnet (AZ1)
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: 10.0.192.0/18
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Private Subnet (AZ2)
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Public Routes
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Private Routes (AZ1)
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Private Routes (AZ2)
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+  NoIngressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: no-ingress-sg
+      GroupDescription: Security group with no ingress rule
+      VpcId: !Ref VPC
+
+  CodeBuildArtifacts:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm:
+                Fn::If:
+                  - S3UseDefaultEncryption
+                  - AES256
+                  - aws:kms
+              KMSMasterKeyID:
+                Fn::If:
+                  - S3UseDefaultEncryption
+                  - !Ref AWS::NoValue
+                  - Fn::If:
+                      - S3UseDefaultEncryptionKey
+                      - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+                      - !Ref S3EncryptionKeyArn
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+  CodeBuildServiceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-CodeBuildServiceRolePolicy
+      Roles:
+        - !Ref CodeBuildServiceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: !GetAtt CodeBuildServiceRole.Arn
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeDhcpOptions
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeVpcs
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterfacePermission
+            Condition:
+              StringEquals:
+                'ec2:AuthorizedService': codebuild.amazonaws.com
+                'ec2:Subnet':
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnet1}
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnet2}
+            Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:GetObjectVersion
+            Resource: !Sub ${CodeBuildArtifacts.Arn}/*
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr-public:GetAuthorizationToken
+              - sts:GetServiceBearerToken
+            Resource:  '*'
+          - Effect: Allow
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr-public:GetDownloadUrlForLayer
+              - ecr-public:BatchGetImage
+              - ecr-public:BatchCheckLayerAvailability
+              - ecr-public:PutImage
+              - ecr-public:InitiateLayerUpload
+              - ecr-public:UploadLayerPart
+              - ecr-public:CompleteLayerUpload
+            Resource: !GetAtt SatosaImages.Arn
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - CodeBuildServiceRole
+      - CodeBuildServiceRolePolicy
+    Properties:
+      ServiceRole: !Ref CodeBuildServiceRole
+      VpcConfig:
+        VpcId: !Ref VPC
+        Subnets:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref NoIngressSecurityGroup
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: .awscodepipeline/buildspec.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:2.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: CODE_BUILD_SERVICE_ROLE_ARN
+            Value: !GetAtt CodeBuildServiceRole.Arn
+          - Name: ARTIFACT_BUCKET
+            Type: PLAINTEXT
+            Value: !Ref CodeBuildArtifacts
+          - Name: S3SERVERSIDEENCRYPTION
+            Type: PLAINTEXT
+            Value: !Ref S3ServerSideEncryption
+          - Name: S3ENCRYPTIONKEYARN
+            Type: PLAINTEXT
+            Value: !Ref S3EncryptionKeyArn
+          - Name: REGISTRYSERVER
+            Type: PLAINTEXT
+            Value: !Ref RegistryServer
+          - Name: REGISTRYOWNER
+            Type: PLAINTEXT
+            Value: !Ref RegistryOwner
+          - Name: REGISTRYCREDENTIALSARN
+            Type: PLAINTEXT
+            Value: !Ref RegistryCredentialsArn
+
+  # connecting to a third party Git server requires manual authorization
+  GitRepoConnector:
+    Type: AWS::CodeStarConnections::Connection
+    Condition: UseCodeStarConnections
+    Properties:
+      ConnectionName: !Ref AWS::StackName
+      ProviderType: !Ref GitServer
+
+  # connecting to a CodeCommit repo requires an EventBridge rule
+  GitRepoEventBridgeRole:
+    Type: AWS::IAM::Role
+    Condition: UseCodeCommit
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+  GitRepoEventBridgeRule:
+    Type: AWS::Events::Rule
+    Condition: UseCodeCommit
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !Ref GitRepoId
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref GitRepoBranch
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          RoleArn: !GetAtt GitRepoEventBridgeRole.Arn
+          Id: codepipeline-AppPipeline
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Artifacts
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !Sub ${CodeBuildArtifacts.Arn}/*
+                  - !GetAtt CodeBuildArtifacts.Arn
+              - Fn::If:
+                  - UseCodeCommit
+                  - Effect: Allow
+                    Action:
+                      - codecommit:CancelUploadArchive
+                      - codecommit:GetBranch
+                      - codecommit:GetCommit
+                      - codecommit:GetUploadArchiveStatus
+                      - codecommit:UploadArchive
+                    Resource: !Ref GitRepoId
+                  - Effect: Allow
+                    Action: codestar-connections:UseConnection
+                    Resource: !Ref GitRepoConnector
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
+                Resource: '*'
+  # cf. https://docs.aws.amazon.com/codepipeline/latest/userguide/action-reference.html
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodeBuildArtifacts
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: !If [ UseCodeCommit, CodeCommit, CodeStarSourceConnection ]
+                Version: 1
+              Configuration:
+                Fn::If:
+                  - UseCodeCommit
+                  - RepositoryName: !Select [ 5, !Split [ ':', !Ref GitRepoId ] ]
+                    PollForSourceChanges: false
+                    BranchName: !Ref GitRepoBranch
+                  - ConnectionArn: !Ref GitRepoConnector
+                    FullRepositoryId: !Ref GitRepoId
+                    BranchName: !Ref GitRepoBranch
+              RunOrder: 1
+              OutputArtifacts:
+                - Name: SourceArtifact
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+  PipelineWeeklyRefreshRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+  PipelineWeeklyRefreshRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(0 0 ? * 1 *)
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          RoleArn: !GetAtt PipelineWeeklyRefreshRole.Arn
+          Id: codepipeline-AppPipeline
+
+
+Outputs:
+  S3BucketName:
+    Value: !Sub s3://${S3Bucket}
+  S3BucketConsole:
+    Value: !Sub 'https://s3.console.aws.amazon.com/s3/buckets/${S3Bucket}?region=${AWS::Region}&tab=objects'
+  S3BucketReadOnlyAclArn:
+    Value: !Ref S3BucketReadOnlyAcl
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
