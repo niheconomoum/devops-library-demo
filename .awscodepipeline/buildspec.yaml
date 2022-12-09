@@ -6,15 +6,6 @@ phases:
       nodejs: latest
       golang: latest
     commands:
-      - TEMP_ROLE=`aws sts assume-role --role-arn $CODE_BUILD_SERVICE_ROLE_ARN --role-session-name test`
-      - export TEMP_ROLE
-      - echo $TEMP_ROLE
-      - export AWS_ACCESS_KEY_ID=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.AccessKeyId')
-      - export AWS_SECRET_ACCESS_KEY=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SecretAccessKey')
-      - export AWS_SESSION_TOKEN=$(echo "${TEMP_ROLE}" | jq -r '.Credentials.SessionToken')
-      - echo $AWS_ACCESS_KEY_ID
-      - echo $AWS_SECRET_ACCESS_KEY
-      - echo $AWS_SESSION_TOKEN
       - git clone --depth=1 https://github.com/docker-library/bashbrew; (cd bashbrew; go mod download; ./bashbrew.sh --version; cp bin/bashbrew /usr/local/bin/); rm -rf bashbrew
       - git clone --depth=1 https://github.com/estesp/manifest-tool; (cd manifest-tool; make build; cp manifest-tool /usr/local/bin/); rm -rf manifest-tool
   pre_build:
