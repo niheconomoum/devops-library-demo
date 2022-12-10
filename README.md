@@ -38,7 +38,7 @@ In shell scripts, indent using single tabs instead of spaces.
 
 ## Git Commit Messages
 
-The following Git commit scopes are currently in use:
+Please follow [Angular Commit Message Conventions](https://github.com/angular/angular/blob/main/CONTRIBUTING.md#-commit-message-format). The following scopes are currently in use:
 - **pipeline**: the CloudFormation stack template defining the CI/CD pipeline
 - **buildspec**: the CodeBuild specification
 - **license**: software licensing information, specifically [LICENSE.md](LICENSE.md)
